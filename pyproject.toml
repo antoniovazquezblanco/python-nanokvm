@@ -47,23 +47,8 @@ required-version = ">=0.5.0"
 target-version = "py311"
 line-length = 88
 
-exclude = [
-    ".venv",
-    ".git",
-    ".tox",
-    "docs",
-    "venv",
-    "bin",
-    "lib",
-    "deps",
-    "build",
-]
-
 [tool.ruff.lint]
 select = ["E", "F", "UP", "B", "SIM", "I"]
-
-[tool.ruff.lint.per-file-ignores]
-"tests/*.py" = ["F811"]
 
 [tool.ruff.lint.isort]
 force-sort-within-sections = true
@@ -94,7 +79,4 @@ source = ["nanokvm"]
 exclude_lines = [
     "pragma: no cover",
     "if TYPE_CHECKING:",
-    "if typing.TYPE_CHECKING:",
-    "raise NotImplementedError",
-    "raise NotImplementedError()",
 ]
