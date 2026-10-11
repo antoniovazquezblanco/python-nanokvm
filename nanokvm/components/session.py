@@ -58,7 +58,7 @@ _LOGGER = logging.getLogger(__name__)
 
 _SESSION_COOKIE_NAME = "nano-kvm-token"
 _NOT_STARTED = "NanoKVMClient is not started; use 'async with NanoKVMClient(...)'"
-_CURRENT_PASSWORD_MIN_NON_PRO_VERSION = "2.5.1"
+_CURRENT_PASSWORD_MIN_NON_PRO_VERSION = (2, 5, 1)
 
 
 class SessionController:
@@ -382,29 +382,27 @@ class SessionController:
         generation = await self.clear_local_session()
         _LOGGER.debug("Attempting authentication for user: %s", username)
 
-        if self._use_password_obfuscation is True:
-            _LOGGER.debug("Using password obfuscation (forced)")
-            await self.do_authenticate(
-                username, obfuscate_password(password), generation=generation
+        # Unknown mode: try obfuscated first, then plain text, and remember
+        # whichever the device accepts.
+        forced = self._use_password_obfuscation
+        modes = (True, False) if forced is None else (forced,)
+        for obfuscate in modes:
+            _LOGGER.debug(
+                "Authenticating with %s password",
+                "obfuscated" if obfuscate else "plain text",
             )
-        elif self._use_password_obfuscation is False:
-            _LOGGER.debug("Using plain text password (forced)")
-            await self.do_authenticate(username, password, generation=generation)
-        else:
-            _LOGGER.debug("Auto-detecting password mode")
             try:
                 await self.do_authenticate(
-                    username, obfuscate_password(password), generation=generation
+                    username,
+                    obfuscate_password(password) if obfuscate else password,
+                    generation=generation,
                 )
-                self._use_password_obfuscation = True
-                _LOGGER.info("Auto-detected obfuscated password mode")
             except NanoKVMAuthenticationFailure:
-                _LOGGER.debug(
-                    "Obfuscated authentication failed, trying plain text password"
-                )
-                await self.do_authenticate(username, password, generation=generation)
-                self._use_password_obfuscation = False
-                _LOGGER.info("Auto-detected plain text password mode")
+                if obfuscate is modes[-1]:
+                    raise
+            else:
+                self._use_password_obfuscation = obfuscate
+                break
 
         self.check_session_generation(generation)
         return generation
@@ -492,19 +490,13 @@ class SessionController:
                 raise NanoKVMNotAuthenticatedError("Client is not authenticated")
             await self.detect_versions()
 
-        if self._application_version is None:
+        parsed_version = _parse_version(self._application_version or "")
+        if parsed_version is None:
             raise NanoKVMError(
                 "Application version must be identified before changing the password"
             )
 
-        parsed_version = _parse_version(self._application_version)
-        minimum_version = _parse_version(_CURRENT_PASSWORD_MIN_NON_PRO_VERSION)
-        if parsed_version is None or minimum_version is None:
-            raise NanoKVMError(
-                "Application version must be identified before changing the password"
-            )
-
-        return parsed_version >= minimum_version
+        return parsed_version >= _CURRENT_PASSWORD_MIN_NON_PRO_VERSION
 
     async def change_password(
         self,
