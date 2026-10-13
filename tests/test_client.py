@@ -1,119 +1,13 @@
-import asyncio
-import io
-import logging
-from pathlib import Path
+"""Tests for the client facade and the shared response envelope."""
 
-import aiohttp
-from aiohttp import ClientSession, web
+from aiohttp import ClientSession
 from aioresponses import aioresponses
-from PIL import Image
 import pytest
-import yarl
 
-from nanokvm.client import (
-    NanoKVMApiError,
-    NanoKVMClient,
-    NanoKVMInvalidResponseError,
-    NanoKVMNotSupportedError,
-)
-from nanokvm.compatibility import _parse_version, _version_at_least
-from nanokvm.models import (
-    ApiResponseCode,
-    DiskType,
-    DNSMode,
-    DownloadStatus,
-    GetMacRsp,
-    GetOLEDRsp,
-    HWVersion,
-    MouseJigglerMode,
-    OledType,
-    ShortcutKey,
-    StatusImageRsp,
-    StreamMode,
-    VirtualDevice,
-)
+from nanokvm.client import NanoKVMApiError, NanoKVMClient, NanoKVMInvalidResponseError
+from nanokvm.models import GetMacRsp, GetOLEDRsp, HWVersion, OledType
 
-from .common import info_payload, mark_detected
-
-
-def test_version_parser() -> None:
-    """Test internal application version parsing and comparison."""
-    assert _parse_version("v2.4.1") == (2, 4, 1)
-    assert _parse_version("dev") is None
-    assert _version_at_least("1.2.14", "1.2.9")
-    assert _version_at_least("2.4", "2.4.0")
-    assert not _version_at_least("2.4.0", "2.4.1")
-    assert _version_at_least("dev", "2.4.1")
-
-
-@pytest.mark.parametrize(
-    ("hardware", "expected_prefix"),
-    [
-        (HWVersion.PRO, "/storage/download"),
-        (HWVersion.PCIE, "/download"),
-        (HWVersion.UNKNOWN, "/download"),
-        (None, "/download"),
-    ],
-)
-async def test_image_download_prefix_by_hardware_family(
-    hardware: HWVersion | None,
-    expected_prefix: str,
-    client: NanoKVMClient,
-) -> None:
-    """Image download routes use the Pro prefix only for Pro hardware."""
-    client._session._hw_version = hardware
-
-    assert client._image_download_prefix() == expected_prefix
-
-
-@pytest.mark.parametrize(
-    "status",
-    ["success", "failed", "checksum_failed"],
-)
-def test_download_status_accepts_terminal_states(status: str) -> None:
-    """Download status responses include terminal success and failure states."""
-    response = StatusImageRsp.model_validate(
-        {"status": status, "file": "image.iso", "percentage": ""}
-    )
-
-    assert response.status is DownloadStatus(status)
-
-
-async def test_get_images_success(client: NanoKVMClient, mocked: aioresponses) -> None:
-    """Test get_images with a successful response."""
-    mocked.get(
-        "http://localhost:8888/api/storage/image",
-        payload={
-            "code": 0,
-            "msg": "success",
-            "data": {
-                "files": [
-                    "/data/alpine-standard-3.23.2-x86_64.iso",
-                    "/data/cs10-js.iso",
-                ]
-            },
-        },
-    )
-
-    response = await client.get_images()
-
-    assert response is not None
-    assert len(response.files) == 2
-    assert "/data/alpine-standard-3.23.2-x86_64.iso" in response.files
-    assert "/data/cs10-js.iso" in response.files
-
-
-async def test_get_images_empty(client: NanoKVMClient, mocked: aioresponses) -> None:
-    """Test get_images with an empty list."""
-    mocked.get(
-        "http://localhost:8888/api/storage/image",
-        payload={"code": 0, "msg": "success", "data": {"files": []}},
-    )
-
-    response = await client.get_images()
-
-    assert response is not None
-    assert len(response.files) == 0
+from .common import BASE_URL, info_payload, mark_detected
 
 
 async def test_typed_success_response_requires_data(
@@ -121,7 +15,7 @@ async def test_typed_success_response_requires_data(
 ) -> None:
     """A typed endpoint rejects a successful response without its payload."""
     mocked.get(
-        "http://localhost:8888/api/storage/image",
+        f"{BASE_URL}storage/image",
         payload={"code": 0, "msg": "success", "data": None},
     )
 
@@ -134,7 +28,7 @@ async def test_api_error_data_is_not_validated_as_success_model(
 ) -> None:
     """An error envelope is classified before its endpoint data is parsed."""
     mocked.get(
-        "http://localhost:8888/api/storage/image",
+        f"{BASE_URL}storage/image",
         payload={
             "code": -1,
             "msg": "failed to list images",
@@ -148,131 +42,12 @@ async def test_api_error_data_is_not_validated_as_success_model(
     assert exc_info.value.code == -1
 
 
-def test_invalid_response_error_does_not_echo_payload() -> None:
-    """Malformed response errors do not include arbitrary response values."""
-    client = NanoKVMClient("http://localhost:8888/api/")
-    secret = "SYNTHETIC_SECRET_VALUE"
-
-    with pytest.raises(NanoKVMInvalidResponseError) as exc_info:
-        client._session.validate_api_response(
-            {"msg": "invalid", "data": {"token": secret}},
-        )
-
-    assert secret not in str(exc_info.value)
-
-
-async def test_form_response_is_not_logged(
-    tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
-    mocked: aioresponses,
-) -> None:
-    """Multipart responses are not emitted verbatim to debug logs."""
-    script = tmp_path / "test.sh"
-    script.write_text("#!/bin/sh\ntrue\n")
-    secret = "SYNTHETIC_FORM_VALUE"
-    caplog.set_level(logging.DEBUG, logger="nanokvm")
-
-    async with NanoKVMClient(
-        "http://localhost:8888/api/", token="test-token"
-    ) as client:
-        mocked.post(
-            "http://localhost:8888/api/vm/script/upload",
-            payload={
-                "code": 0,
-                "msg": "success",
-                "data": {"file": secret},
-            },
-        )
-
-        await client.upload_script(script)
-
-    assert secret not in caplog.text
-
-
-def test_parse_jpeg_returns_fully_loaded_image() -> None:
-    """JPEG parsing returns an image detached from the source stream."""
-    image_buffer = io.BytesIO()
-    Image.new("RGB", (2, 2), color=(1, 2, 3)).save(image_buffer, format="JPEG")
-    client = NanoKVMClient("http://localhost:8888/api/")
-
-    image = client._parse_jpeg_from_bytes(image_buffer.getvalue())
-
-    assert image.getpixel((0, 0))
-    assert getattr(image, "fp", None) is None
-
-
-async def test_mjpeg_stream_allows_frames_after_request_timeout() -> None:
-    """An MJPEG stream remains open beyond the normal request timeout."""
-    image_buffer = io.BytesIO()
-    Image.new("RGB", (2, 2)).save(image_buffer, format="JPEG")
-    image_data = image_buffer.getvalue()
-
-    async def stream_handler(
-        request: web.Request,
-    ) -> web.StreamResponse:
-        response = web.StreamResponse(
-            headers={"Content-Type": "multipart/x-mixed-replace; boundary=frame"}
-        )
-        await response.prepare(request)
-        for _ in range(2):
-            await response.write(
-                b"--frame\r\n"
-                b"Content-Type: image/jpeg\r\n"
-                + f"Content-Length: {len(image_data)}\r\n\r\n".encode()
-                + image_data
-                + b"\r\n"
-            )
-            await asyncio.sleep(0.55)
-        await response.write(b"--frame--\r\n")
-        await response.write_eof()
-        return response
-
-    application = web.Application()
-    application.router.add_get("/api/stream/mjpeg", stream_handler)
-    runner = web.AppRunner(application)
-    await runner.setup()
-    site = web.TCPSite(runner, "127.0.0.1", 0)
-    await site.start()
-    server_sockets = getattr(site._server, "sockets", None)
-    assert server_sockets
-    port = server_sockets[0].getsockname()[1]
-
-    frames = []
-    try:
-        async with NanoKVMClient(
-            f"http://127.0.0.1:{port}/api/", token="test-token", request_timeout=1
-        ) as client:
-            async with asyncio.timeout(3):
-                async for frame in client.mjpeg_stream():
-                    frames.append(frame)
-    finally:
-        await runner.cleanup()
-
-    assert len(frames) == 2
-
-
-async def test_get_images_api_error(
-    client: NanoKVMClient, mocked: aioresponses
-) -> None:
-    """Test get_images with an API error response."""
-    mocked.get(
-        "http://localhost:8888/api/storage/image",
-        payload={"code": -1, "msg": "failed to list images", "data": None},
-    )
-
-    with pytest.raises(NanoKVMApiError) as exc_info:
-        await client.get_images()
-
-    assert exc_info.value.code == ApiResponseCode.FAILURE
-    assert "failed to list images" in exc_info.value.msg
-
-
 async def test_detect_versions_stores_application_and_image(
     client: NanoKVMClient, mocked: aioresponses
 ) -> None:
     """Test detect_versions caches versions from /vm/info."""
     mocked.get(
-        "http://localhost:8888/api/vm/info",
+        f"{BASE_URL}vm/info",
         payload=info_payload(application="2.4.1", image="1.4.0"),
     )
 
@@ -287,7 +62,7 @@ async def test_api_error_allows_endpoint_specific_codes(
 ) -> None:
     """Test endpoint-specific API error codes are surfaced as API errors."""
     mocked.post(
-        "http://localhost:8888/api/storage/image/mount",
+        f"{BASE_URL}storage/image/mount",
         payload={"code": -6, "msg": "mount image failed", "data": None},
     )
 
@@ -306,7 +81,7 @@ async def test_none_returning_endpoint_preserves_unknown_api_code(
     mark_detected(client)
 
     mocked.post(
-        "http://localhost:8888/api/vm/web-title",
+        f"{BASE_URL}vm/web-title",
         payload={"code": -4, "msg": "failed to set title", "data": None},
     )
 
@@ -315,236 +90,6 @@ async def test_none_returning_endpoint_preserves_unknown_api_code(
 
     assert exc_info.value.code == -4
     assert "failed to set title" in exc_info.value.msg
-
-
-async def test_get_web_title_returns_default_when_unset(
-    client: NanoKVMClient, mocked: aioresponses
-) -> None:
-    """Test the firmware's failed read of an unset title maps to the default."""
-    mark_detected(client)
-
-    mocked.get(
-        "http://localhost:8888/api/vm/web-title",
-        payload={"code": -1, "msg": "read web title failed", "data": None},
-    )
-
-    assert (await client.get_web_title()).title == "NanoKVM"
-
-
-async def test_mount_image_sends_pro_read_only_flag(
-    client: NanoKVMClient, mocked: aioresponses
-) -> None:
-    """Test mount_image sends the Pro readOnly field."""
-    mocked.post(
-        "http://localhost:8888/api/storage/image/mount",
-        payload={"code": 0, "msg": "success", "data": None},
-    )
-
-    mark_detected(client, HWVersion.PRO, "1.2.1")
-    await client.mount_image("/data/test.img", read_only=True)
-
-    calls = mocked.requests[
-        ("POST", yarl.URL("http://localhost:8888/api/storage/image/mount"))
-    ]
-    assert calls[0].kwargs.get("json") == {
-        "file": "/data/test.img",
-        "cdrom": False,
-        "readOnly": True,
-    }
-
-
-async def test_get_oled_info_raises_for_pro_invalid_file_content(
-    client: NanoKVMClient, mocked: aioresponses
-) -> None:
-    """Test Pro OLED invalid file content follows upstream error semantics."""
-    client._session._hw_version = HWVersion.PRO
-
-    mocked.get(
-        "http://localhost:8888/api/vm/oled",
-        payload={
-            "code": -2,
-            "msg": "invalid file content",
-            "data": None,
-        },
-    )
-
-    with pytest.raises(NanoKVMApiError) as exc_info:
-        await client.get_oled_info()
-
-    assert exc_info.value.code == -2
-    assert exc_info.value.msg == "invalid file content"
-    info_url = yarl.URL("http://localhost:8888/api/vm/info")
-    assert ("GET", info_url) not in mocked.requests
-
-
-async def test_set_mouse_jiggler_state_noops_when_already_disabled(
-    client: NanoKVMClient, mocked: aioresponses
-) -> None:
-    """Test disabling mouse jiggler is idempotent."""
-    mark_detected(client)
-
-    mocked.get(
-        "http://localhost:8888/api/vm/mouse-jiggler",
-        payload={
-            "code": 0,
-            "msg": "success",
-            "data": {"enabled": False, "mode": "relative"},
-        },
-    )
-
-    await client.set_mouse_jiggler_state(
-        enabled=False,
-        mode=MouseJigglerMode.RELATIVE,
-    )
-
-    post_url = yarl.URL("http://localhost:8888/api/vm/mouse-jiggler/")
-    assert ("POST", post_url) not in mocked.requests
-
-
-async def test_update_virtual_device_ignores_success_data(
-    client: NanoKVMClient, mocked: aioresponses
-) -> None:
-    """Test update_virtual_device handles non-Pro success payloads."""
-    mocked.post(
-        "http://localhost:8888/api/vm/device/virtual",
-        payload={"code": 0, "msg": "success", "data": {"on": True}},
-    )
-
-    await client.update_virtual_device(VirtualDevice.DISK)
-
-    calls = mocked.requests[
-        ("POST", yarl.URL("http://localhost:8888/api/vm/device/virtual"))
-    ]
-    assert calls[0].kwargs.get("json") == {"device": "disk"}
-
-
-async def test_get_virtual_device_status_handles_non_pro_shape(
-    client: NanoKVMClient, mocked: aioresponses
-) -> None:
-    """Test virtual device status keeps non-Pro fields intact."""
-    mocked.get(
-        "http://localhost:8888/api/vm/device/virtual",
-        payload={
-            "code": 0,
-            "msg": "success",
-            "data": {"network": True, "media": False, "disk": True},
-        },
-    )
-
-    response = await client.get_virtual_device_status()
-
-    assert response.network is True
-    assert response.media is False
-    assert response.disk is True
-    assert response.mounted_disk is None
-
-
-async def test_get_virtual_device_status_handles_pro_shape(
-    client: NanoKVMClient, mocked: aioresponses
-) -> None:
-    """Test Pro virtual device status exposes Pro fields without fake non-Pro disk."""
-    client._session._hw_version = HWVersion.PRO
-
-    mocked.get(
-        "http://localhost:8888/api/vm/device/virtual",
-        payload={
-            "code": 0,
-            "msg": "success",
-            "data": {
-                "isNetworkEnabled": True,
-                "isMicEnabled": True,
-                "mountedDisk": "emmc",
-                "isSdCardExist": True,
-                "isEmmcExist": True,
-            },
-        },
-    )
-
-    response = await client.get_virtual_device_status()
-
-    assert response.network is True
-    assert response.mic is True
-    assert response.mounted_disk == "emmc"
-    assert response.is_sd_card_exist is True
-    assert response.is_emmc_exist is True
-    assert response.media is None
-    assert response.disk is None
-
-
-async def test_update_virtual_device_sends_pro_disk_type(
-    client: NanoKVMClient, mocked: aioresponses
-) -> None:
-    """Test Pro disk virtual device requests include the disk type."""
-    client._session._hw_version = HWVersion.PRO
-
-    mocked.post(
-        "http://localhost:8888/api/vm/device/virtual",
-        payload={"code": 0, "msg": "success", "data": None},
-    )
-
-    await client.update_virtual_device(
-        VirtualDevice.DISK,
-        disk_type=DiskType.EMMC,
-    )
-
-    calls = mocked.requests[
-        ("POST", yarl.URL("http://localhost:8888/api/vm/device/virtual"))
-    ]
-    assert calls[0].kwargs.get("json") == {
-        "device": "disk",
-        "type": "emmc",
-    }
-
-
-async def test_set_led_strip_partial_preserves_current_config(
-    client: NanoKVMClient, mocked: aioresponses
-) -> None:
-    """Test partial LED updates post a complete Pro LED configuration."""
-    client._session._hw_version = HWVersion.PRO
-
-    mocked.get(
-        "http://localhost:8888/api/vm/ledstrip/get",
-        payload={
-            "code": 0,
-            "msg": "success",
-            "data": {
-                "on": True,
-                "hor": 8,
-                "ver": 6,
-                "brightness": 25,
-            },
-        },
-    )
-    mocked.post(
-        "http://localhost:8888/api/vm/ledstrip/set",
-        payload={"code": 0, "msg": "success", "data": None},
-    )
-
-    await client.set_led_strip(brightness=50)
-
-    calls = mocked.requests[
-        ("POST", yarl.URL("http://localhost:8888/api/vm/ledstrip/set"))
-    ]
-    assert calls[0].kwargs.get("json") == {
-        "on": True,
-        "hor": 8,
-        "ver": 6,
-        "brightness": 50,
-    }
-
-
-async def test_get_wol_macs_returns_empty_list_for_missing_file(
-    client: NanoKVMClient, mocked: aioresponses
-) -> None:
-    """Test WOL getter normalizes the empty-file device state."""
-    mocked.get(
-        "http://localhost:8888/api/network/wol/mac",
-        payload={"code": -2, "msg": "open file error", "data": None},
-    )
-
-    response = await client.get_wol_macs()
-
-    assert response.macs == []
 
 
 def test_model_normalizations_for_wol_and_oled() -> None:
@@ -558,326 +103,9 @@ def test_model_normalizations_for_wol_and_oled() -> None:
     )
 
 
-async def test_connect_wifi_no_auth_sends_ap_header(
-    client: NanoKVMClient, mocked: aioresponses
-) -> None:
-    """Test AP-mode Wi-Fi connection sends setup credentials without auth cookie."""
-    mocked.post(
-        "http://localhost:8888/api/network/wifi",
-        payload={"code": 0, "msg": "success", "data": None},
-    )
-
-    await client.connect_wifi_no_auth(
-        "NanoKVM-Setup",
-        ap_password="setup-secret",
-    )
-
-    calls = mocked.requests[
-        ("POST", yarl.URL("http://localhost:8888/api/network/wifi"))
-    ]
-    assert calls[0].kwargs.get("json") == {
-        "ssid": "NanoKVM-Setup",
-        "password": "",
-    }
-    assert calls[0].kwargs.get("cookies") == {}
-    assert calls[0].kwargs.get("headers", {})["X-AP-Key"] == "setup-secret"
-
-
-async def test_get_dns_parses_configuration(
-    client: NanoKVMClient, mocked: aioresponses
-) -> None:
-    """Test DNS configuration response parsing."""
-    mark_detected(client, application_version="2.4.1")
-
-    mocked.get(
-        "http://localhost:8888/api/network/dns",
-        payload={
-            "code": 0,
-            "msg": "success",
-            "data": {
-                "mode": "manual",
-                "servers": ["1.1.1.1", "2606:4700:4700::1111"],
-                "effective": ["1.1.1.1"],
-                "dhcp": ["192.168.1.1"],
-                "info": {
-                    "interface": "eth0",
-                    "type": "Wired",
-                    "address": "192.168.1.20/24",
-                    "subnetMask": "255.255.255.0",
-                    "gateway": "192.168.1.1",
-                    "searchDomains": ["lan"],
-                },
-            },
-        },
-    )
-
-    response = await client.get_dns()
-
-    assert response.mode is DNSMode.MANUAL
-    assert response.servers == ["1.1.1.1", "2606:4700:4700::1111"]
-    assert response.effective == ["1.1.1.1"]
-    assert response.dhcp == ["192.168.1.1"]
-    assert response.info.interface == "eth0"
-    assert response.info.type == "Wired"
-    assert response.info.address == "192.168.1.20/24"
-    assert response.info.subnet_mask == "255.255.255.0"
-    assert response.info.gateway == "192.168.1.1"
-    assert response.info.search_domains == ["lan"]
-
-
-async def test_set_dns_manual_sends_servers(
-    client: NanoKVMClient, mocked: aioresponses
-) -> None:
-    """Test manual DNS mode sends the configured servers."""
-    mark_detected(client, application_version="2.4.1")
-
-    mocked.post(
-        "http://localhost:8888/api/network/dns",
-        payload={"code": 0, "msg": "success", "data": None},
-    )
-
-    await client.set_dns(
-        DNSMode.MANUAL,
-        ["1.1.1.1", "2606:4700:4700::1111"],
-    )
-
-    calls = mocked.requests[("POST", yarl.URL("http://localhost:8888/api/network/dns"))]
-    assert calls[0].kwargs.get("json") == {
-        "mode": "manual",
-        "servers": ["1.1.1.1", "2606:4700:4700::1111"],
-    }
-
-
-async def test_set_dns_dhcp_string_sends_empty_servers(
-    client: NanoKVMClient, mocked: aioresponses
-) -> None:
-    """Test DHCP DNS mode accepts string mode and sends empty servers."""
-    mark_detected(client, application_version="2.4.1")
-
-    mocked.post(
-        "http://localhost:8888/api/network/dns",
-        payload={"code": 0, "msg": "success", "data": None},
-    )
-
-    await client.set_dns("dhcp")
-
-    calls = mocked.requests[("POST", yarl.URL("http://localhost:8888/api/network/dns"))]
-    assert calls[0].kwargs.get("json") == {
-        "mode": "dhcp",
-        "servers": [],
-    }
-
-
-async def test_get_dns_pro_is_not_supported(
-    client: NanoKVMClient, mocked: aioresponses
-) -> None:
-    """Test DNS management is limited to non-Pro hardware."""
-    client._session._hw_version = HWVersion.PRO
-
-    with pytest.raises(NanoKVMNotSupportedError) as exc_info:
-        await client.get_dns()
-
-    assert "get_dns requires hardware: non-Pro" in str(exc_info.value)
-    assert not mocked.requests
-
-
-async def test_get_dns_old_application_version_is_not_supported(
-    client: NanoKVMClient, mocked: aioresponses
-) -> None:
-    """Test old non-Pro application versions reject DNS before endpoint call."""
-    client._session._hw_version = HWVersion.PCIE
-
-    mocked.get(
-        "http://localhost:8888/api/vm/info",
-        payload=info_payload(application="2.4.0"),
-    )
-
-    with pytest.raises(NanoKVMNotSupportedError) as exc_info:
-        await client.get_dns()
-
-    assert "get_dns requires non-Pro application version >= 2.4.1" in str(
-        exc_info.value
-    )
-    dns_url = yarl.URL("http://localhost:8888/api/network/dns")
-    assert ("GET", dns_url) not in mocked.requests
-
-
-async def test_get_dns_exact_application_version_is_supported(
-    client: NanoKVMClient, mocked: aioresponses
-) -> None:
-    """Test DNS is allowed at the first upstream version that introduced it."""
-    client._session._hw_version = HWVersion.PCIE
-
-    mocked.get(
-        "http://localhost:8888/api/vm/info",
-        payload=info_payload(application="2.4.1"),
-    )
-    mocked.get(
-        "http://localhost:8888/api/network/dns",
-        payload={
-            "code": 0,
-            "msg": "success",
-            "data": {
-                "mode": "dhcp",
-                "servers": [],
-                "effective": [],
-                "dhcp": [],
-                "info": {},
-            },
-        },
-    )
-
-    response = await client.get_dns()
-
-    assert response.mode is DNSMode.DHCP
-
-
-async def test_non_pro_application_version_gate_uses_non_pro_minimum(
-    client: NanoKVMClient, mocked: aioresponses
-) -> None:
-    """Test non-Pro devices use the non-Pro minimum application version."""
-    mark_detected(client, application_version="2.3.1")
-
-    with pytest.raises(NanoKVMNotSupportedError) as exc_info:
-        await client.get_shortcuts()
-
-    assert "get_shortcuts requires non-Pro application version >= 2.3.2" in str(
-        exc_info.value
-    )
-    shortcuts_url = yarl.URL("http://localhost:8888/api/hid/shortcuts")
-    assert ("GET", shortcuts_url) not in mocked.requests
-
-
-async def test_pro_application_version_gate_uses_pro_minimum(
-    client: NanoKVMClient, mocked: aioresponses
-) -> None:
-    """Test Pro devices use the Pro minimum application version."""
-    mark_detected(
-        client,
-        hw_version=HWVersion.PRO,
-        application_version="1.2.7",
-    )
-
-    with pytest.raises(NanoKVMNotSupportedError) as exc_info:
-        await client.get_shortcuts()
-
-    assert "get_shortcuts requires Pro application version >= 1.2.8" in str(
-        exc_info.value
-    )
-    shortcuts_url = yarl.URL("http://localhost:8888/api/hid/shortcuts")
-    assert ("GET", shortcuts_url) not in mocked.requests
-
-
-async def test_upload_script_uses_multipart_form(
-    tmp_path: Path, client: NanoKVMClient, mocked: aioresponses
-) -> None:
-    """Test script upload uses the shared multipart helper."""
-    script = tmp_path / "test.sh"
-    script.write_text("#!/bin/sh\ntrue\n")
-
-    mocked.post(
-        "http://localhost:8888/api/vm/script/upload",
-        payload={
-            "code": 0,
-            "msg": "success",
-            "data": {"file": "test.sh"},
-        },
-    )
-
-    response = await client.upload_script(script)
-
-    calls = mocked.requests[
-        ("POST", yarl.URL("http://localhost:8888/api/vm/script/upload"))
-    ]
-    assert isinstance(calls[0].kwargs.get("data"), aiohttp.FormData)
-    assert response.file == "test.sh"
-
-
-async def test_shortcut_methods_send_expected_payloads(
-    client: NanoKVMClient, mocked: aioresponses
-) -> None:
-    """Test custom shortcut client helpers use the expected endpoints."""
-    mark_detected(client, application_version="2.3.4")
-
-    mocked.post(
-        "http://localhost:8888/api/hid/shortcut",
-        payload={"code": 0, "msg": "success", "data": None},
-    )
-    mocked.delete(
-        "http://localhost:8888/api/hid/shortcut",
-        payload={"code": 0, "msg": "success", "data": None},
-    )
-    mocked.post(
-        "http://localhost:8888/api/hid/shortcut/leader-key",
-        payload={"code": 0, "msg": "success", "data": None},
-    )
-
-    key = ShortcutKey(code="ControlLeft", label="Ctrl")
-    await client.add_shortcut([key])
-    await client.delete_shortcut("shortcut-1")
-    await client.set_leader_key("ControlLeft")
-
-    shortcut_calls = mocked.requests[
-        ("POST", yarl.URL("http://localhost:8888/api/hid/shortcut"))
-    ]
-    delete_calls = mocked.requests[
-        ("DELETE", yarl.URL("http://localhost:8888/api/hid/shortcut"))
-    ]
-    leader_calls = mocked.requests[
-        (
-            "POST",
-            yarl.URL("http://localhost:8888/api/hid/shortcut/leader-key"),
-        )
-    ]
-    assert shortcut_calls[0].kwargs.get("json") == {
-        "keys": [{"code": "ControlLeft", "label": "Ctrl"}]
-    }
-    assert delete_calls[0].kwargs.get("json") == {"id": "shortcut-1"}
-    assert leader_calls[0].kwargs.get("json") == {"key": "ControlLeft"}
-
-
-async def test_tailscale_login_returns_url(
-    client: NanoKVMClient, mocked: aioresponses
-) -> None:
-    """Test Tailscale login returns the upstream login URL payload."""
-    mark_detected(client, application_version="2.1.6")
-
-    mocked.post(
-        "http://localhost:8888/api/extensions/tailscale/login",
-        payload={
-            "code": 0,
-            "msg": "success",
-            "data": {"url": "https://login.tailscale.com/a/test"},
-        },
-    )
-
-    response = await client.tailscale_login()
-
-    assert response.url == "https://login.tailscale.com/a/test"
-
-
-async def test_set_stream_mode_accepts_existing_string_values(
-    client: NanoKVMClient, mocked: aioresponses
-) -> None:
-    """Test set_stream_mode remains source-compatible with valid strings."""
-    client._session._hw_version = HWVersion.PRO
-
-    mocked.post(
-        "http://localhost:8888/api/stream/mode",
-        payload={"code": 0, "msg": "success", "data": None},
-    )
-
-    await client.set_stream_mode(StreamMode.H264_DIRECT.value)
-
-    calls = mocked.requests[("POST", yarl.URL("http://localhost:8888/api/stream/mode"))]
-    assert calls[0].kwargs.get("json") == {"mode": "h264-direct"}
-
-
 async def test_client_context_manager() -> None:
     """Test that client properly initializes and cleans up with context manager."""
-    async with NanoKVMClient(
-        "http://localhost:8888/api/", token="test-token"
-    ) as client:
+    async with NanoKVMClient(BASE_URL, token="test-token") as client:
         # Verify session is created
         assert client._session._http_session is not None
         assert not client._session._http_session.closed
@@ -889,12 +117,12 @@ async def test_client_context_manager() -> None:
 async def test_client_context_manager_external_session() -> None:
     """Test that client properly deals with an external session."""
     async with ClientSession() as session:
-        client3 = NanoKVMClient("http://localhost:8888/api/", session=session)
+        client3 = NanoKVMClient(BASE_URL, session=session)
 
         # All clients connect with the same external session
         async with (
-            NanoKVMClient("http://localhost:8888/api/", session=session) as client1,
-            NanoKVMClient("http://localhost:8888/api/", session=session) as client2,
+            NanoKVMClient(BASE_URL, session=session) as client1,
+            NanoKVMClient(BASE_URL, session=session) as client2,
             client3,
         ):
             # Verify session is created
@@ -913,30 +141,6 @@ async def test_client_context_manager_external_session() -> None:
 
 async def test_request_outside_context_manager_explains_how_to_start() -> None:
     """Using the client without 'async with' raises a clear error."""
-    client = NanoKVMClient("http://localhost:8888/api/", token="synthetic-token")
+    client = NanoKVMClient(BASE_URL, token="synthetic-token")
     with pytest.raises(RuntimeError, match="async with NanoKVMClient"):
         await client.get_gpio()
-
-
-async def test_mount_image_read_only_requires_pro_1_2_1(
-    client: NanoKVMClient, mocked: aioresponses
-) -> None:
-    """Older Pro firmware ignores readOnly, so the client refuses it first."""
-    mark_detected(client, HWVersion.PRO, "1.2.0")
-    with pytest.raises(NanoKVMNotSupportedError, match="1.2.1"):
-        await client.mount_image("/data/test.img", read_only=True)
-    assert not mocked.requests
-
-
-async def test_mjpeg_stream_bytes_yields_raw_frames(mocked: aioresponses) -> None:
-    """The byte stream hands out each JPEG part untouched."""
-    mocked.get(
-        "http://localhost:8888/api/stream/mjpeg",
-        headers={"Content-Type": "multipart/x-mixed-replace; boundary=frame"},
-        body=b"--frame\r\nContent-Type: image/jpeg\r\n\r\n\xff\xd8one\r\n"
-        b"--frame\r\nContent-Type: image/jpeg\r\n\r\n\xff\xd8two\r\n--frame--\r\n",
-    )
-    async with NanoKVMClient("http://localhost:8888/api/", token="test-token") as c:
-        frames = [frame async for frame in c.mjpeg_stream_bytes()]
-
-    assert frames == [b"\xff\xd8one", b"\xff\xd8two"]

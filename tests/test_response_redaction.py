@@ -2,6 +2,7 @@
 
 from collections.abc import Awaitable
 import logging
+from pathlib import Path
 import traceback
 
 import aiohttp
@@ -15,7 +16,8 @@ from nanokvm.client import (
     NanoKVMInvalidResponseError,
 )
 
-_URL = "http://kvm.local/api/"
+from .common import BASE_URL
+
 _SECRET = "synthetic-secret-value"
 
 
@@ -27,22 +29,22 @@ async def test_invalid_response_traceback_and_exception_log_hide_payload(
 ) -> None:
     """logger.exception renders causes as well as the top-level error message."""
     caplog.set_level(logging.DEBUG)
-    async with NanoKVMClient(_URL, token="synthetic-session") as client:
+    async with NanoKVMClient(BASE_URL, token="synthetic-session") as client:
         if source == "login-token":
             mocked.post(
-                f"{_URL}auth/login",
+                f"{BASE_URL}auth/login",
                 payload={"code": 0, "msg": "ok", "data": {"token": [_SECRET]}},
             )
         elif source == "envelope":
             mocked.get(
-                f"{_URL}auth/account",
+                f"{BASE_URL}auth/account",
                 payload={"code": [_SECRET], "msg": "ok", "data": None},
             )
         elif source == "form":
-            mocked.post(f"{_URL}upload", payload={"code": [_SECRET]})
+            mocked.post(f"{BASE_URL}upload", payload={"code": [_SECRET]})
         else:
             mocked.get(
-                f"{_URL}auth/account",
+                f"{BASE_URL}auth/account",
                 payload={"code": 0, "msg": "ok", "data": {"username": [_SECRET]}},
             )
         try:
@@ -69,21 +71,21 @@ async def test_invalid_utf8_response_is_rejected_consistently(
 ) -> None:
     """All JSON response paths translate invalid UTF-8 into the client error."""
     async with NanoKVMClient(
-        _URL,
+        BASE_URL,
         token="synthetic-session",
         use_password_obfuscation=True,
     ) as client:
         operation: Awaitable[object]
         if transport == "json":
-            mocked.get(f"{_URL}auth/account", body=b"\xff")
+            mocked.get(f"{BASE_URL}auth/account", body=b"\xff")
             operation = client.get_account()
         elif transport == "form":
-            mocked.post(f"{_URL}upload", body=b"\xff")
+            mocked.post(f"{BASE_URL}upload", body=b"\xff")
             operation = client._session.api_request_json(
                 "POST", "/upload", data=aiohttp.FormData()
             )
         else:
-            mocked.post(f"{_URL}auth/login", body=b"\xff")
+            mocked.post(f"{BASE_URL}auth/login", body=b"\xff")
             operation = client.authenticate("synthetic-user", "synthetic-password")
 
         with pytest.raises(NanoKVMInvalidResponseError, match="Invalid JSON response"):
@@ -98,9 +100,9 @@ async def test_server_messages_are_not_rendered_in_logs_or_errors(
 ) -> None:
     """Firmware text is untrusted and can echo a credential or token."""
     caplog.set_level(logging.DEBUG)
-    async with NanoKVMClient(_URL, use_password_obfuscation=True) as client:
+    async with NanoKVMClient(BASE_URL, use_password_obfuscation=True) as client:
         mocked.post(
-            f"{_URL}auth/login",
+            f"{BASE_URL}auth/login",
             payload={
                 "code": code,
                 "msg": _SECRET,
@@ -108,7 +110,7 @@ async def test_server_messages_are_not_rendered_in_logs_or_errors(
             },
         )
         mocked.get(
-            f"{_URL}vm/hardware",
+            f"{BASE_URL}vm/hardware",
             payload={"code": 0, "msg": "ok", "data": {"version": "PCIE"}},
         )
         try:
@@ -120,3 +122,42 @@ async def test_server_messages_are_not_rendered_in_logs_or_errors(
                 assert error.code == code
                 assert error.msg == _SECRET
         assert _SECRET not in caplog.text
+
+
+def test_invalid_response_error_does_not_echo_payload() -> None:
+    """Malformed response errors do not include arbitrary response values."""
+    client = NanoKVMClient(BASE_URL)
+    secret = "SYNTHETIC_SECRET_VALUE"
+
+    with pytest.raises(NanoKVMInvalidResponseError) as exc_info:
+        client._session.validate_api_response(
+            {"msg": "invalid", "data": {"token": secret}},
+        )
+
+    assert secret not in str(exc_info.value)
+
+
+async def test_form_response_is_not_logged(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    mocked: aioresponses,
+) -> None:
+    """Multipart responses are not emitted verbatim to debug logs."""
+    script = tmp_path / "test.sh"
+    script.write_text("#!/bin/sh\ntrue\n")
+    secret = "SYNTHETIC_FORM_VALUE"
+    caplog.set_level(logging.DEBUG, logger="nanokvm")
+
+    async with NanoKVMClient(BASE_URL, token="test-token") as client:
+        mocked.post(
+            f"{BASE_URL}vm/script/upload",
+            payload={
+                "code": 0,
+                "msg": "success",
+                "data": {"file": secret},
+            },
+        )
+
+        await client.upload_script(script)
+
+    assert secret not in caplog.text
