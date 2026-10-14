@@ -14,6 +14,7 @@ __all__ = [
     "CreateUserReq",
     "DNSInfo",
     "DNSMode",
+    "GetAutostartRsp",
     "GetCdRomRsp",
     "GetDNSRsp",
     "GetHdmiStateRsp",
@@ -31,15 +32,19 @@ __all__ = [
     "SetAIControlModeReq",
     "SetAIControlModeRsp",
     "SetDNSReq",
+    "SetFrameDetectReq",
     "SetHdmiIdleTimeoutReq",
     "SetInputRegionReq",
     "SetMCPConfigReq",
     "SetMemoryLimitReq",
     "SetScreenReq",
     "SetSwapSizeReq",
+    "SetTlsReq",
     "SetUpdateServerReq",
     "SetUserPasswordReq",
+    "StopFrameDetectReq",
     "UpdateUserReq",
+    "UploadAutostartReq",
     "UserInfo",
     "UserRole",
 ]
@@ -87,6 +92,18 @@ class SetScreenReq(BaseModel):
 
     type: ScreenSettingType
     value: int
+
+
+class SetTlsReq(BaseModel):
+    enabled: bool
+
+
+class SetFrameDetectReq(BaseModel):
+    enabled: bool
+
+
+class StopFrameDetectReq(BaseModel):
+    duration: int
 
 
 class GetMCPConfigRsp(BaseModel):
@@ -220,6 +237,19 @@ class GetSwapSizeRsp(BaseModel):
 
 class SetSwapSizeReq(BaseModel):
     size: int
+
+
+class GetAutostartRsp(BaseModel):
+    files: list[str] = Field(default_factory=list)
+
+    @field_validator("files", mode="before")
+    @classmethod
+    def _normalize_files(cls, value: Any) -> Any:
+        return [] if value is None else value
+
+
+class UploadAutostartReq(BaseModel):
+    content: str
 
 
 class GetUpdateServerRsp(BaseModel):

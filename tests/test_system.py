@@ -1,5 +1,8 @@
 """Tests for system, virtual device and LED operations."""
 
+from datetime import UTC, datetime
+
+import aiohttp
 from aioresponses import aioresponses
 import pytest
 import yarl
@@ -172,3 +175,29 @@ async def test_set_led_strip_partial_preserves_current_config(
         "ver": 6,
         "brightness": 50,
     }
+
+
+async def test_get_time_reads_first_stream_event(
+    client: NanoKVMClient, mocked: aioresponses
+) -> None:
+    """Test get_time parses the first event of the Pro clock stream."""
+    mark_detected(client, HWVersion.PRO, "1.2.15")
+    mocked.get(
+        f"{BASE_URL}vm/time",
+        body="event:message\ndata:1791944949000\n\nevent:message\ndata:1\n\n",
+    )
+
+    assert await client.get_time() == datetime(2026, 10, 14, 2, 29, 9, tzinfo=UTC)
+
+
+async def test_set_tls_treats_restart_disconnect_as_success(
+    client: NanoKVMClient, mocked: aioresponses
+) -> None:
+    """Test set_tls succeeds when the device restarts before answering."""
+    mark_detected(client, HWVersion.PCIE, "2.5.2")
+    mocked.post(f"{BASE_URL}vm/tls", exception=aiohttp.ServerDisconnectedError())
+
+    await client.set_tls(True)
+
+    calls = mocked.requests[("POST", yarl.URL(f"{BASE_URL}vm/tls"))]
+    assert calls[0].kwargs["json"] == {"enabled": True}
