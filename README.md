@@ -45,5 +45,6 @@ Scripts that do not use asyncio can use the same API as blocking calls through
 - [API reference](docs/api.md): every method and the hardware and firmware it
   needs
 - [Blocking client](docs/sync.md): the API without asyncio
+- [Command line](docs/cli.md): the `nanokvm` command for one-off actions
 - [Errors](docs/errors.md)
 - [SSH](docs/ssh.md)
