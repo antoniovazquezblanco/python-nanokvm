@@ -117,8 +117,8 @@ while loop.time() < end:
 
 | Methods | Requires |
 |---|---|
-| `mjpeg_stream`, `mjpeg_stream_bytes`, `open_ws` | all |
-| `set_screen`, `set_frame_detect`, `pause_frame_detect` | non-Pro |
+| `mjpeg_stream`, `mjpeg_stream_bytes`, `open_ws`, `open_webrtc_signaling` | all |
+| `get_snapshot`, `set_screen`, `set_frame_detect`, `pause_frame_detect` | non-Pro |
 | `get_input_region`, `set_input_region`, `get_input_resolution` | non-Pro 2.5.1 |
 | `reset_hdmi` | PCIe 2.1.5 |
 | `get_hdmi_state`, `enable_hdmi`, `disable_hdmi` | PCIe 2.2.8 |
@@ -130,10 +130,15 @@ while loop.time() < end:
 | `set_rate_control_mode` | Pro 1.2.6 |
 | `set_fps` | Pro 1.2.8 |
 
-`mjpeg_stream()` yields decoded `PIL.Image` frames; `mjpeg_stream_bytes()`
-yields the raw JPEG bytes. `open_ws(path)` opens a new WebSocket on a path
-relative to the API base, such as `stream/h264/webrtc`, for protocols the
-client does not wrap. The caller closes it before the client exits.
+`mjpeg_stream()` yields decoded `PIL.Image` frames, `mjpeg_stream_bytes()` the
+raw JPEG bytes, and `get_snapshot()` the first one. `open_webrtc_signaling()`
+returns the H.264 WebRTC signaling session for the detected hardware.
+[Video streaming](streaming.md) covers both, and why the Pro refuses
+snapshots.
+
+`open_ws(path)` opens a new WebSocket on a path relative to the API base, such
+as `stream/h264/webrtc`, for protocols the client does not wrap. The caller
+closes it before the client exits.
 
 ### Images and scripts
 
